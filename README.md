@@ -66,4 +66,4 @@ python main.py --full       # full pipeline (train + IoT + camera)
 - If Streamlit cannot import local modules, ensure you run from the project root so relative imports resolve.
 
 ## License
-This project is licensed under the MIT License (see `LICENSE`).
+This project is licensed under the MIT License.
