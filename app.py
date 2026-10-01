@@ -337,6 +337,8 @@ if launch_btn:
             f_s = " + ".join(status_parts)
         elif is_anomaly_detected:
             f_s = "FUTURE ANOMALY ⚠️"
+        elif sequence_result["status"] in {"warming_up", "invalid_reading"}:
+            f_s = "SENSOR WARMUP"
         elif not sequence_result["ready"]:
             f_s = "WAITING FOR FUTURE"
         else:
@@ -354,6 +356,10 @@ if launch_btn:
             diag_html += f'<div style="font-size:0.8rem; color:#ff4d4d; margin-top:10px; font-weight:600;">👤 DETECTION: {p_count} humain(s) (YOLOv8 + DeepSort)</div>'
         if sequence_result["ready"]:
             diag_html += f'<div style="font-size:0.8rem; color:#ffa500; margin-top:5px; font-weight:600;">Sensor state: {sensor_state.upper()} | Prediction error: {sequence_result["prediction_error"]:.6f} | Threshold: {sequence_result["anomaly_threshold"]:.6f}</div>'
+        elif sequence_result["status"] == "invalid_reading":
+            diag_html += f'<div style="font-size:0.8rem; color:#ffa500; margin-top:5px; font-weight:600;">Sensor reading ignored: {sequence_result.get("reason", "invalid input")}. No anomaly alert emitted.</div>'
+        elif sequence_result["status"] == "warming_up":
+            diag_html += f'<div style="font-size:0.8rem; color:#4facfe; margin-top:5px; font-weight:600;">Warmup: {sequence_result["valid_readings"]}/{sequence_result["startup_warmup_readings"]} valid readings. Alerts disabled.</div>'
         else:
             diag_html += f'<div style="font-size:0.8rem; color:#4facfe; margin-top:5px; font-weight:600;">Sensor state: {sensor_state.upper()} | Prediction issued; awaiting {sequence_predictor.prediction_horizon} actual future readings.</div>'
         

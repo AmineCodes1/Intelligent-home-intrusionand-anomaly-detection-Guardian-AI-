@@ -50,7 +50,7 @@ python main.py --full       # full pipeline (train + IoT + camera)
 ## How It Works
 - **Config**: Tuning lives in `utils/config.py` (sensor ranges, camera FPS, LSTM hyperparameters, thresholds).
 - **Training**: `main.py --train` trains an encoder/decoder LSTM on normal sensor histories, predicts five future steps, and derives its error threshold from normal validation windows only. Intrusion classification is handled by the video detector, not sensor classifiers.
-- **Inference**: The dashboard uses YOLOv8/tracking for human intrusion and separately consumes a 100-reading `IoTSimulator` stream, predicts the next five sensor readings, waits for those five actual readings, and compares scaled mean-squared prediction error with the saved threshold.
+- **Inference**: The dashboard uses YOLOv8/tracking for human intrusion and separately consumes a 100-reading `IoTSimulator` stream. Non-finite or physically out-of-range readings are ignored, the first ten valid readings are warm-up only, and only completed five-reading futures are compared with the saved scaled-error threshold.
 - **Recording**: When people are detected, frames are annotated and clips are written under `outputs/recordings`.
 - **Logging**: Structured console + file logging under `logs`.
 

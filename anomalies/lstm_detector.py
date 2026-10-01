@@ -11,7 +11,7 @@ from sklearn.preprocessing import StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from utils.config import SEQUENCE_CONFIG, SYSTEM_CONFIG
+from utils.config import IOT_CONFIG, SEQUENCE_CONFIG, SYSTEM_CONFIG
 from utils.logger import logger
 
 
@@ -53,6 +53,10 @@ class LSTMSequencePredictor:
         self.history = deque(maxlen=self.input_sequence_length)
         self.pending_prediction: Optional[np.ndarray] = None
         self.pending_actual = []
+        self.valid_readings = 0
+        sensor_config = IOT_CONFIG["sensors"]
+        self.sensor_mins = np.asarray([sensor_config[name]["min"] for name in sensor_config], dtype=np.float32)
+        self.sensor_maxs = np.asarray([sensor_config[name]["max"] for name in sensor_config], dtype=np.float32)
         os.makedirs(SYSTEM_CONFIG["model_dir"], exist_ok=True)
 
     def create_windows(self, stream: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -147,19 +151,43 @@ class LSTMSequencePredictor:
                 "is_anomaly": bool(error > self.threshold), "predicted_sequence": prediction, "actual_sequence": actual}
 
     def observe(self, reading: np.ndarray) -> Dict:
-        """Consume one reading and score only when a pending future is complete."""
+        """Consume a validated reading and score only after a reliable future exists."""
         reading = np.asarray(reading, dtype=np.float32)
-        self.history.append(reading)
         result = {"ready": False, "is_anomaly": False, "prediction_error": None,
-                  "anomaly_threshold": self.threshold, "predicted_sequence": None, "actual_sequence": None}
+                  "anomaly_threshold": self.threshold, "predicted_sequence": None,
+                  "actual_sequence": None, "status": "invalid_reading",
+                  "valid_readings": self.valid_readings,
+                  "startup_warmup_readings": self.config["startup_warmup_readings"]}
+        if reading.shape != (self.feature_count,):
+            result["reason"] = "unexpected_shape"
+            return result
+        if self.config["reject_non_finite_readings"] and not np.all(np.isfinite(reading)):
+            result["reason"] = "non_finite_value"
+            return result
+        if self.config["reject_out_of_range_readings"] and np.any(
+            (reading < self.sensor_mins) | (reading > self.sensor_maxs)
+        ):
+            result["reason"] = "outside_physical_sensor_range"
+            return result
+
+        self.valid_readings += 1
+        self.history.append(reading)
+        result["valid_readings"] = self.valid_readings
         if self.pending_prediction is not None:
             self.pending_actual.append(reading.copy())
             if len(self.pending_actual) == self.prediction_horizon:
                 result = self.score_prediction(self.pending_prediction, np.asarray(self.pending_actual))
+                result["status"] = "scored"
+                result["valid_readings"] = self.valid_readings
+                result["startup_warmup_readings"] = self.config["startup_warmup_readings"]
                 self.pending_prediction = None
                 self.pending_actual = []
-        if len(self.history) == self.input_sequence_length and self.pending_prediction is None:
+        if (self.valid_readings >= self.config["startup_warmup_readings"]
+                and len(self.history) == self.input_sequence_length
+                and self.pending_prediction is None):
             self.pending_prediction = self.predict_next_sequence(np.asarray(self.history))
+        if not result["ready"]:
+            result["status"] = "warming_up" if self.valid_readings < self.config["startup_warmup_readings"] else "forecast_pending"
         return result
 
     def reset_stream(self) -> None:
@@ -167,6 +195,7 @@ class LSTMSequencePredictor:
         self.history.clear()
         self.pending_prediction = None
         self.pending_actual = []
+        self.valid_readings = 0
 
     def evaluate(self, test_stream: np.ndarray, point_labels: np.ndarray) -> Dict:
         """Evaluate future-window errors using labels only after training is complete."""

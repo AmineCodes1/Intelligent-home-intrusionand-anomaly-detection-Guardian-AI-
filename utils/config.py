@@ -32,6 +32,9 @@ SEQUENCE_CONFIG = {
     "epochs": 10,
     "num_threads": 1,
     "threshold_percentile": 95.0,
+    "startup_warmup_readings": 10,
+    "reject_non_finite_readings": True,
+    "reject_out_of_range_readings": True,
     "random_state": 42
 }
 
