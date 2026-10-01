@@ -6,19 +6,17 @@ import os
 import sys
 import time
 import argparse
+import numpy as np
 from colorama import Fore, Style, init
 
 init(autoreset=True)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from utils.logger import logger, NotificationLogger
-from utils.config import SYSTEM_CONFIG
+from utils.config import IOT_CONFIG, SYSTEM_CONFIG
 from iot.simulator import IoTSimulator
-from iot.processor import IoTProcessor
-from models.classifier import IntrusionClassifier
 from camera.detector import CameraDetector
-from anomalies.ensemble import AnomalyEnsemble
+from anomalies.lstm_detector import LSTMSequencePredictor
 
 
 def ensure_directories():
@@ -44,9 +42,8 @@ def print_banner():
 
 {Fore.YELLOW}Features:{Style.RESET_ALL}
   - Real-time IoT sensor monitoring (vibration, audio, temp, CO2, PIR)
-  - ML-based event classification (Random Forest, SVM, XGBoost)
-  - Camera-based human detection (YOLOv8-style) with DeepSort tracking
-  - Anomaly detection (Isolation Forest, Autoencoder, LSTM)
+    - Camera-based human intrusion detection with YOLOv8 and real DeepSORT tracking
+    - LSTM next-sequence sensor anomaly detection trained on normal behavior
   - Automatic video recording on intrusion detection
 
 {Fore.GREEN}Status: System Initializing...{Style.RESET_ALL}
@@ -55,98 +52,64 @@ def print_banner():
 
 
 def train_models():
-    """Train all ML models."""
+    """Train the LSTM sensor anomaly model."""
     print(f"\n{Fore.CYAN}{'='*60}")
     print("TRAINING MACHINE LEARNING MODELS")
     print(f"{'='*60}{Style.RESET_ALL}\n")
     
     simulator = IoTSimulator()
     
-    print("1. Generating training data...")
-    point_data = simulator.generate_dataset(n_samples=2000, include_intrusion=True)
-    sequences, _ = simulator.generate_sequence_data(n_sequences=200, sequence_length=10, include_anomalies=False)
-    
-    print(f"   - Point data: {point_data.shape[0]} samples")
-    print(f"   - Sequence data: {sequences.shape[0]} sequences")
-    
-    print("\n2. Training Classification Models...")
-    classifier = IntrusionClassifier()
-    class_results = classifier.train(point_data)
-    classifier.save_models()
-    
-    print("\n   Results:")
-    for model_name, result in class_results.items():
-        print(f"   - {model_name}: Accuracy = {result['accuracy']:.4f}")
-    
-    print("\n3. Training Anomaly Detection Models...")
-    X_point = point_data.drop(columns=["label"]).values
-    ensemble = AnomalyEnsemble()
-    anom_results = ensemble.train_all(X_point, sequences)
-    ensemble.save_all()
-    
-    print("\n   Results:")
-    for model_name, result in anom_results.items():
-        if "threshold" in result:
-            print(f"   - {model_name}: Threshold = {result['threshold']:.4f}")
+    print("1. Training LSTM Next-Sequence Anomaly Detector...")
+    normal_train = simulator.generate_normal_sensor_stream(n_samples=1600)
+    normal_validation = simulator.generate_normal_sensor_stream(n_samples=600)
+    test_stream, test_labels = simulator.generate_evaluation_stream(block_length=30, n_blocks=40)
+    predictor = LSTMSequencePredictor()
+    sequence_results = predictor.train(normal_train, normal_validation)
+    predictor.save()
+    evaluation = predictor.evaluate(test_stream, test_labels)
+    print(f"   - Input shape: (batch, {sequence_results['input_sequence_length']}, {normal_train.shape[1]})")
+    print(f"   - Target shape: (batch, {sequence_results['prediction_horizon']}, {normal_train.shape[1]})")
+    print(f"   - Normal validation threshold: {sequence_results['threshold']:.6f}")
+    print("\n   Evaluation on labeled test stream:")
+    print(f"   - Test points: {len(test_labels)} ({int(np.sum(test_labels == 0))} normal, {int(np.sum(test_labels == 1))} anomalous)")
+    for metric in ["accuracy", "precision", "recall", "f1"]:
+        print(f"   - {metric.title()}: {evaluation[metric]:.4f}")
+    print(f"   - Confusion matrix: {evaluation['confusion_matrix']}")
     
     print(f"\n{Fore.GREEN}All models trained and saved successfully!{Style.RESET_ALL}")
     
-    return classifier, ensemble
+    return predictor
 
 
-def run_iot_demo(classifier, anomaly_ensemble, duration=30):
+def run_iot_demo(predictor, duration=30):
     """Run IoT sensor monitoring demo."""
     print(f"\n{Fore.CYAN}{'='*60}")
     print("IOT SENSOR MONITORING DEMO")
     print(f"{'='*60}{Style.RESET_ALL}\n")
     
     simulator = IoTSimulator()
-    processor = IoTProcessor()
-    
-    intrusion_count = 0
     anomaly_count = 0
+    predictor_feature_names = list(IOT_CONFIG["sensors"].keys())
     
     print(f"Monitoring for {duration} sensor readings...\n")
     
-    for i, (reading, true_state) in enumerate(simulator.generate_stream(n_samples=duration, include_intrusion=True)):
-        result = processor.process_reading(reading)
-        check = processor.comprehensive_check(reading)
+    for i, (reading, true_state) in enumerate(simulator.generate_stream(n_samples=duration, include_anomalies=True)):
+        features = np.array([reading[sensor] for sensor in predictor_feature_names])
+        sequence_result = predictor.observe(features)
         
-        features = processor.get_raw_features(reading)
-        prediction, confidence = classifier.predict(features, model_name="xgboost")
+        anomaly_status = "WAITING FOR FUTURE"
+        if sequence_result["ready"]:
+            anomaly_status = "ANOMALY" if sequence_result["is_anomaly"] else "NORMAL"
+            print(f"   Prediction error: {sequence_result['prediction_error']:.6f} | Threshold: {sequence_result['anomaly_threshold']:.6f}")
+        print(f"[{i+1:3d}] Sensor state: {true_state} | Sequence: {anomaly_status}")
         
-        anomaly_result = anomaly_ensemble.predict_point(features)
-        
-        status_color = Fore.GREEN if prediction == 0 else Fore.RED
-        predicted_label = ["Normal", "Intrusion", "Anomaly"][prediction]
-        
-        print(f"[{i+1:3d}] {status_color}Status: {predicted_label} (conf: {confidence:.2f}){Style.RESET_ALL} | "
-              f"True: {true_state} | Anomaly: {anomaly_result['ensemble']['is_anomaly']}")
-        
-        if check["overall_alert"]:
-            if check["door"]["alert"]:
-                logger.warning(f"   Door: {check['door']['message']}")
-            if check["motion"]["alert"]:
-                logger.warning(f"   Motion: {check['motion']['message']}")
-            if check["device"]["alert"]:
-                logger.warning(f"   Device: {check['device']['message']}")
-        
-        if prediction == 1:
-            intrusion_count += 1
-            logger.mobile_notification(
-                "INTRUSION ALERT",
-                f"Suspicious activity detected! Confidence: {confidence:.0%}",
-                priority="high"
-            )
-        
-        if anomaly_result['ensemble']['is_anomaly']:
+        if sequence_result["ready"] and sequence_result["is_anomaly"]:
             anomaly_count += 1
         
         time.sleep(0.1)
     
     print(f"\n{Fore.YELLOW}Demo Summary:{Style.RESET_ALL}")
     print(f"  Total readings: {duration}")
-    print(f"  Intrusions detected: {intrusion_count}")
     print(f"  Anomalies detected: {anomaly_count}")
 
 
@@ -181,11 +144,11 @@ def run_full_system():
     
     print(f"\n{Fore.YELLOW}Phase 1: Training Models{Style.RESET_ALL}")
     print("-" * 40)
-    classifier, anomaly_ensemble = train_models()
+    predictor = train_models()
     
     print(f"\n{Fore.YELLOW}Phase 2: IoT Monitoring Demo{Style.RESET_ALL}")
     print("-" * 40)
-    run_iot_demo(classifier, anomaly_ensemble, duration=20)
+    run_iot_demo(predictor, duration=20)
     
     print(f"\n{Fore.YELLOW}Phase 3: Camera Detection Demo{Style.RESET_ALL}")
     print("-" * 40)
@@ -229,14 +192,11 @@ def main():
         train_models()
     elif args.iot:
         print_banner()
-        classifier = IntrusionClassifier()
-        if not classifier.load_models():
-            print("Models not found. Training first...")
-            classifier, anomaly_ensemble = train_models()
-        else:
-            anomaly_ensemble = AnomalyEnsemble()
-            anomaly_ensemble.load_all()
-        run_iot_demo(classifier, anomaly_ensemble)
+        predictor = LSTMSequencePredictor()
+        if not predictor.load():
+            print("LSTM model not found. Training first...")
+            predictor = train_models()
+        run_iot_demo(predictor)
     elif args.camera:
         print_banner()
         run_camera_demo()

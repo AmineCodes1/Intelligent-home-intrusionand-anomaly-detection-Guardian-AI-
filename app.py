@@ -23,16 +23,14 @@ try:
     from camera.video_simulator import VideoSimulator
     from camera.detector import CameraDetector
     from utils.config import IOT_CONFIG, CAMERA_CONFIG
-    from models.classifier import IntrusionClassifier
-    from anomalies.ensemble import AnomalyEnsemble
+    from anomalies.lstm_detector import LSTMSequencePredictor
 except ImportError:
     try:
         from Project_Amine.iot.simulator import IoTSimulator
         from Project_Amine.camera.video_simulator import VideoSimulator
         from Project_Amine.camera.detector import CameraDetector
         from Project_Amine.utils.config import IOT_CONFIG, CAMERA_CONFIG
-        from Project_Amine.models.classifier import IntrusionClassifier
-        from Project_Amine.anomalies.ensemble import AnomalyEnsemble
+        from Project_Amine.anomalies.lstm_detector import LSTMSequencePredictor
     except ImportError as e:
         st.error(f"Erreur d'importation : {e}")
         st.stop()
@@ -210,44 +208,27 @@ st.markdown("""
 # --- Model Loading ---
 @st.cache_resource
 def load_ai_models():
-    classifier = IntrusionClassifier()
-    classifier.load_models()
-    anomaly_ensemble = AnomalyEnsemble()
-    anomaly_ensemble.load_all()
+    sequence_predictor = LSTMSequencePredictor()
+    if not sequence_predictor.load():
+        st.error("LSTM model not found. Run `python main.py --train` first.")
+        st.stop()
     # Initialize Camera Detector for person detection & tracking
     cam_detector = CameraDetector()
-    return classifier, anomaly_ensemble, cam_detector
+    return sequence_predictor, cam_detector
 
-classifier, anomaly_ensemble, cam_detector = load_ai_models()
+sequence_predictor, cam_detector = load_ai_models()
 
 # --- Sidebar ---
 with st.sidebar:
     st.markdown("<h2 style='color:#4facfe;'>COMMAND CENTER</h2>", unsafe_allow_html=True)
     
     with st.expander("📡 IOT TELEMETRY", expanded=True):
-        manual_inputs = {}
-        units = {
-            "vibration": "v",
-            "audio": "dB",
-            "temperature": "°C",
-            "co2": "ppm"
-        }
-        for sensor, cfg in IOT_CONFIG["sensors"].items():
-            if sensor == "pir_motion":
-                manual_inputs[sensor] = st.checkbox(f"PIR Discovery", value=False)
-            else:
-                normal_range = cfg.get("normal_range", [cfg["min"], cfg["max"]])
-                normal_mid = (normal_range[0] + normal_range[1]) / 2
-                unit = units.get(sensor, "")
-                manual_inputs[sensor] = st.slider(
-                    f"{sensor.upper()} ({unit})",
-                    float(cfg["min"]), float(cfg["max"]), float(normal_mid)
-                )
+        st.markdown("**Automatic IoT simulation**")
+        st.caption("100 generated sensor readings per scan")
 
     with st.expander("🧠 AI PROTOCOLS", expanded=True):
         include_intruder = st.toggle("Human Signature Simulation", value=False)
-        duration = st.select_slider("Burst Depth", options=[60, 120, 240, 480], value=60)
-        record_video = st.toggle("Protocol: Auto-Archive", value=True)
+        duration = 100
 
     launch_btn = st.button("EXECUTE NEURAL SCAN", width='stretch', type="primary")
 
@@ -273,8 +254,8 @@ with col_main:
     video_placeholder = st.empty()
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown('<div class="section-title">Model Decision Matrix</div>', unsafe_allow_html=True)
-    model_comparison_placeholder = st.empty()
+    st.markdown('<div class="section-title">Sensor Prediction Monitor</div>', unsafe_allow_html=True)
+    sensor_placeholder = st.empty()
 
 with col_side:
     st.markdown('<div class="section-title">Threat Assessment</div>', unsafe_allow_html=True)
@@ -289,6 +270,8 @@ with col_side:
 # --- Logic ---
 if 'terminal_logs' not in st.session_state:
     st.session_state.terminal_logs = []
+if 'prediction_errors' not in st.session_state:
+    st.session_state.prediction_errors = []
 
 def add_smart_log(msg, level="info"):
     ts = datetime.now().strftime("%H:%M:%S")
@@ -306,73 +289,56 @@ if launch_btn:
         cam_detector.tracker.reset()
     cam_detector.recording = False
     cam_detector.recording_buffer = []
+    sequence_predictor.reset_stream()
+    st.session_state.prediction_errors = []
 
     prog = st.progress(0)
     video_sim = VideoSimulator()
+    sensor_sim = IoTSimulator()
+    sensor_stream = sensor_sim.generate_stream(n_samples=duration, include_anomalies=True)
+    sensor_names = list(IOT_CONFIG["sensors"].keys())
 
-    for i in range(duration):
+    for i, (sensor_reading, sensor_state) in enumerate(sensor_stream):
         # Get frame with optional intruder
         raw_frame, sim_detections = video_sim.get_frame(include_intruder=include_intruder)
         
         # Process frame with YOLO + Tracking
-        # Use our CameraDetector which handles YOLO + DeepSort-style tracking
+        # CameraDetector handles YOLO detections and real DeepSORT tracking.
         cam_result = cam_detector.process_frame(raw_frame, sim_detections)
         
         # Annotate frame for display
         display_frame = cam_detector.draw_detections(raw_frame, cam_result)
         
-        # IOT Data Processing
-        input_data = [
-            manual_inputs["vibration"],
-            manual_inputs["audio"],
-            manual_inputs["temperature"],
-            manual_inputs["co2"],
-            1.0 if manual_inputs["pir_motion"] else 0.0
-        ]
+        input_data = [sensor_reading[sensor] for sensor in sensor_names]
+        sensor_placeholder.dataframe(
+            pd.DataFrame([input_data], columns=sensor_names),
+            hide_index=True,
+            use_container_width=True
+        )
         
-        ensemble_res = classifier.predict_ensemble(input_data)
-        anom_res = anomaly_ensemble.predict_point(np.array(input_data))
-        
-        # Determine anomaly description
-        anomaly_msg = ""
-        anomaly_details = []
-        is_anomaly_detected = anom_res.get("ensemble", {}).get("is_anomaly", False)
-        if is_anomaly_detected:
-            anom_types = []
-            if anom_res.get("isolation_forest", {}).get("is_anomaly"): anom_types.append("Isolation Forest")
-            if anom_res.get("autoencoder", {}).get("is_anomaly"): anom_types.append("Autoencoder")
-            anomaly_msg = " | Source: " + ", ".join(anom_types) if anom_types else ""
-            
-            # Identify which sensor might be causing the anomaly
-            sensor_names = ["vibration", "audio", "temperature", "co2", "pir_motion"]
-            for sensor, value in zip(sensor_names, input_data):
-                cfg = IOT_CONFIG["sensors"].get(sensor, {})
-                normal_range = cfg.get("normal_range", [cfg.get("min", 0), cfg.get("max", 100)])
-                if value < normal_range[0] or value > normal_range[1]:
-                    unit = units.get(sensor, "")
-                    anomaly_details.append(f"{sensor.upper()} anormal ({value}{unit})")
-        
-        detail_text = " | " + ", ".join(anomaly_details) if anomaly_details else ""
+        sequence_result = sequence_predictor.observe(np.array(input_data, dtype=np.float32))
+        is_anomaly_detected = sequence_result["ready"] and sequence_result["is_anomaly"]
+        if sequence_result["ready"]:
+            st.session_state.prediction_errors.append(sequence_result["prediction_error"])
+            st.session_state.prediction_errors = st.session_state.prediction_errors[-100:]
         
         # Smart Decision Fusion
         is_human = cam_result["is_intrusion"]
-        is_iot_intrusion = any(m["prediction"] == 1 for m in ensemble_res.get("models", {}).values())
-        
         # Comprehensive status logic
         status_parts = []
         if is_human:
             status_parts.append("INTRUSION HUMAINE 👤")
-        if is_iot_intrusion:
-            status_parts.append("INTRUSION CAPTEURS 📡")
         
         is_intrusion = len(status_parts) > 0
         
         if is_intrusion and is_anomaly_detected:
-            f_s = " + ".join(status_parts) + " (AVEC ANOMALIE)"
+            f_s = " + ".join(status_parts) + " (FUTURE ANOMALY)"
         elif is_intrusion:
             f_s = " + ".join(status_parts)
         elif is_anomaly_detected:
-            f_s = "ANOMALIE SYSTÈME ⚠️"
+            f_s = "FUTURE ANOMALY ⚠️"
+        elif not sequence_result["ready"]:
+            f_s = "WAITING FOR FUTURE"
         else:
             f_s = "MAISON SÉCURISÉE 🟢"
         
@@ -386,8 +352,10 @@ if launch_btn:
         if is_human:
             p_count = cam_result["person_count"]
             diag_html += f'<div style="font-size:0.8rem; color:#ff4d4d; margin-top:10px; font-weight:600;">👤 DETECTION: {p_count} humain(s) (YOLOv8 + DeepSort)</div>'
-        if is_anomaly_detected:
-            diag_html += f'<div style="font-size:0.8rem; color:#ffa500; margin-top:5px; font-weight:600;">⚠️ DIAGNOSTIC: {anomaly_msg}{detail_text}</div>'
+        if sequence_result["ready"]:
+            diag_html += f'<div style="font-size:0.8rem; color:#ffa500; margin-top:5px; font-weight:600;">Sensor state: {sensor_state.upper()} | Prediction error: {sequence_result["prediction_error"]:.6f} | Threshold: {sequence_result["anomaly_threshold"]:.6f}</div>'
+        else:
+            diag_html += f'<div style="font-size:0.8rem; color:#4facfe; margin-top:5px; font-weight:600;">Sensor state: {sensor_state.upper()} | Prediction issued; awaiting {sequence_predictor.prediction_horizon} actual future readings.</div>'
         
         # Notifications
         if (is_intrusion or is_anomaly_detected) and i % 20 == 0:
@@ -399,17 +367,16 @@ if launch_btn:
             <div style="font-size:0.7rem; color:rgba(255,255,255,0.4); margin-bottom:10px;">THREAT LEVEL</div>
             <div style="font-size:1.8rem; font-weight:900; color:{clr};">{f_s}</div>
             {diag_html}
-            <div style="font-size:0.8rem; margin-top:10px;">Confidence: {ensemble_res["avg_confidence"]*100:.1f}%</div>
+            <div style="font-size:0.8rem; margin-top:10px;">Intrusion source: video detector</div>
         </div>
         """, unsafe_allow_html=True)
 
         # Update Attribution
-        best_model = ensemble_res["best_model"].upper()
         attribution_placeholder.markdown(f"""
         <div class="glass-card" style="background:rgba(0,255,136,0.05); border-color:#00ff8833;">
-            <div style="font-size:0.7rem; color:rgba(255,255,255,0.4); margin-bottom:5px;">ACTIVE EXPERT MODEL</div>
-            <div style="font-size:1.1rem; font-weight:700; color:#00ff88;">{best_model}</div>
-            <div style="font-size:0.8rem; color:rgba(255,255,255,0.6); margin-top:5px;">Leading with highest local confidence.</div>
+            <div style="font-size:0.7rem; color:rgba(255,255,255,0.4); margin-bottom:5px;">INTRUSION DETECTOR</div>
+            <div style="font-size:1.1rem; font-weight:700; color:#00ff88;">YOLOv8 + tracker</div>
+            <div style="font-size:0.8rem; color:rgba(255,255,255,0.6); margin-top:5px;">Video presence is the intrusion signal.</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -437,13 +404,13 @@ if launch_btn:
                 st.info(f"Dernier enregistrement (avec tracking) : {latest_recording}")
 
     # --- Neural Performance Metrics ---
-    st.markdown('<div class="section-title">Model Decision Matrix</div>', unsafe_allow_html=True)
-    m_c1, m_c2, m_c3 = st.columns(3)
-    models_res = ensemble_res.get("models", {})
-    rf_conf = models_res.get("random_forest", {}).get("confidence", 0)
-    svm_conf = models_res.get("svm", {}).get("confidence", 0)
-    xgb_conf = models_res.get("xgboost", {}).get("confidence", 0)
-    
-    with m_c1: st.metric("Random Forest", f"{rf_conf*100:.1f}%")
-    with m_c2: st.metric("SVM Predictor", f"{svm_conf*100:.1f}%")
-    with m_c3: st.metric("XGBoost Engine", f"{xgb_conf*100:.1f}%")
+    if sequence_result["ready"]:
+        st.markdown('<div class="section-title">Future Sequence Comparison</div>', unsafe_allow_html=True)
+        comparison = pd.DataFrame(
+            np.column_stack((sequence_result["actual_sequence"], sequence_result["predicted_sequence"])),
+            columns=[f"{sensor}_actual" for sensor in IOT_CONFIG["sensors"]] + [f"{sensor}_predicted" for sensor in IOT_CONFIG["sensors"]]
+        )
+        st.line_chart(comparison)
+        error_frame = pd.DataFrame({"prediction_error": st.session_state.prediction_errors})
+        error_frame["anomaly_threshold"] = sequence_result["anomaly_threshold"]
+        st.line_chart(error_frame)

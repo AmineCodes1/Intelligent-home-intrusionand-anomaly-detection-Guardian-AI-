@@ -22,7 +22,7 @@ except ImportError:
                     self.boxes = boxes
             # Return empty or dummy result
             return []
-from camera.tracker import SimpleTracker
+from camera.tracker import DeepSortTracker
 from camera.video_simulator import VideoSimulator
 from utils.config import CAMERA_CONFIG
 from utils.logger import logger
@@ -87,7 +87,7 @@ class CameraDetector:
     def __init__(self):
         self.config = CAMERA_CONFIG
         self.detector = YOLODetector(confidence_threshold=self.config["confidence_threshold"])
-        self.tracker = SimpleTracker() if self.config["tracking_enabled"] else None
+        self.tracker = DeepSortTracker() if self.config["tracking_enabled"] else None
         self.video_simulator = VideoSimulator(
             width=self.config["resolution"][0],
             height=self.config["resolution"][1],
@@ -107,9 +107,8 @@ class CameraDetector:
         person_detections = [d for d in detections if d["class"] == "person"]
         
         tracked_persons = []
-        if self.tracker and person_detections:
-            bboxes = [d["bbox"] for d in person_detections]
-            tracked_persons = self.tracker.update(bboxes)
+        if self.tracker:
+            tracked_persons = self.tracker.update(person_detections, frame)
         
         is_intrusion = len(person_detections) > 0
         
@@ -178,7 +177,7 @@ class CameraDetector:
         
         for person in result.get("tracked_persons", []):
             x, y, w, h = person["bbox"]
-            # Draw tracking box and ID to confirm DeepSort-style tracking
+            # Draw the confirmed DeepSORT track box and ID.
             cv2.rectangle(output, (x, y), (x + w, y + h), (255, 0, 0), 1)
             cv2.putText(output, f"ID: {person['id']}", (x, y + h + 20),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
