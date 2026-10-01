@@ -6,7 +6,9 @@ import time
 from typing import List, Dict, Tuple
 try:
     from ultralytics import YOLO
+    REAL_YOLO_AVAILABLE = True
 except ImportError:
+    REAL_YOLO_AVAILABLE = False
     # Fallback simulation if ultralytics is not installed
     class YOLO:
         def __init__(self, model_path=None):
@@ -34,10 +36,11 @@ class YOLODetector:
     def __init__(self, confidence_threshold=0.5):
         self.confidence_threshold = confidence_threshold
         self.classes = ["person", "car", "dog", "cat", "chair"]
+        self.using_real_yolo = REAL_YOLO_AVAILABLE
         try:
             # Attempt to load actual YOLOv8 model if available
             self.model = YOLO("yolov8n.pt")
-            logger.info("Loaded YOLOv8n model successfully")
+            logger.info("Loaded real YOLOv8n model successfully")
         except Exception as e:
             logger.warning(f"Could not load YOLOv8 model, falling back to simulation: {e}")
             self.model = None
@@ -100,8 +103,9 @@ class CameraDetector:
         
         os.makedirs("outputs/recordings", exist_ok=True)
     
-    def process_frame(self, frame: np.ndarray, simulated_detections: List[Dict] = None) -> Dict:
-        """Process a single frame for intrusion detection."""
+    def process_frame(self, frame: np.ndarray, simulated_detections: List[Dict] = None,
+                      manage_recording: bool = True) -> Dict:
+        """Process a frame for intrusion detection, optionally managing recordings."""
         detections = self.detector.detect(frame, simulated_detections)
         
         person_detections = [d for d in detections if d["class"] == "person"]
@@ -120,14 +124,15 @@ class CameraDetector:
             "is_intrusion": is_intrusion
         }
         
-        if is_intrusion and not self.recording:
-            self._start_recording()
-        
-        if self.recording:
-            # Store frame and result for annotation during video generation
-            self.recording_buffer.append({"frame": frame.copy(), "result": result})
-            if len(self.recording_buffer) >= self.config["recording_duration"] * self.config["fps"]:
-                self._stop_recording()
+        if manage_recording:
+            if is_intrusion and not self.recording:
+                self._start_recording()
+
+            if self.recording:
+                # Store frame and result for annotation during video generation
+                self.recording_buffer.append({"frame": frame.copy(), "result": result})
+                if len(self.recording_buffer) >= self.config["recording_duration"] * self.config["fps"]:
+                    self._stop_recording()
         
         return result
     

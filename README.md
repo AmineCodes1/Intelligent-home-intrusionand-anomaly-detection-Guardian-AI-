@@ -45,6 +45,7 @@ python main.py --train      # train the LSTM anomaly detector
 python main.py --iot        # IoT monitoring demo
 python main.py --camera     # camera intrusion demo
 python main.py --full       # full pipeline (train + IoT + camera)
+python -m camera.benchmark # benchmark YOLOv8 + DeepSORT processing
 ```
 
 ## How It Works
@@ -52,6 +53,7 @@ python main.py --full       # full pipeline (train + IoT + camera)
 - **Training**: `main.py --train` trains an encoder/decoder LSTM on normal sensor histories, predicts five future steps, and derives its error threshold from normal validation windows only. Intrusion classification is handled by the video detector, not sensor classifiers.
 - **Inference**: The dashboard uses YOLOv8/tracking for human intrusion and separately consumes a 100-reading `IoTSimulator` stream. Non-finite or physically out-of-range readings are ignored, the first ten valid readings are warm-up only, and only completed five-reading futures are compared with the saved scaled-error threshold.
 - **Recording**: When people are detected, frames are annotated and clips are written under `outputs/recordings`.
+- **Benchmarking**: `python -m camera.benchmark` warms up the existing detector/tracker path, times YOLOv8 plus DeepSORT without rendering or recording, and compares measured pipeline FPS with the simulator input FPS.
 - **Logging**: Structured console + file logging under `logs`.
 
 ## Data & Models
@@ -63,6 +65,24 @@ python main.py --full       # full pipeline (train + IoT + camera)
 - If YOLO weights fail to load, the detector automatically uses a simulation; install `ultralytics` (and PyTorch) to enable real YOLOv8 inference.
 - For OpenCV video writing on Linux/macOS, you may need additional codecs; on Windows the bundled XVID should work.
 - If Streamlit cannot import local modules, ensure you run from the project root so relative imports resolve.
+
+## YOLOv8 + DeepSORT benchmark
+
+Run the end-to-end processing benchmark with:
+
+```powershell
+.venv\Scripts\python.exe -m camera.benchmark
+```
+
+Optional parameters:
+
+```powershell
+.venv\Scripts\python.exe -m camera.benchmark --frames 900 --warmup 30
+```
+
+The benchmark uses the existing `VideoSimulator` data, discards supplied detections, and calls `CameraDetector.process_frame(frame)` so the real Ultralytics YOLO path and real DeepSORT update path are exercised. It pre-generates frames, discards the warm-up frames, disables recording, excludes drawing and logging from the timed interval, and synchronizes CUDA when available.
+
+The output distinguishes the simulator input FPS from measured pipeline FPS. A benchmark result is machine- and configuration-specific. The current repository simulator run measured 9.11 pipeline FPS at 109.83 ms/frame against a 15 FPS input, so it does not support a 15 FPS real-time claim on that environment. The synthetic person drawings were not detected by YOLO in that run, so the result measures detector plus empty DeepSORT updates, not person-tracking quality. Do not claim `30+ FPS` on a CV unless the same benchmark is run on real representative video, with the deployment resolution, model, device, and preprocessing, and the measured pipeline FPS is consistently above 30.
 
 ## LSTM anomaly-detection architecture
 
