@@ -1,187 +1,206 @@
-"""LSTM-based temporal anomaly detection (simplified using scikit-learn)."""
-import numpy as np
-from sklearn.neural_network import MLPRegressor
-from sklearn.preprocessing import StandardScaler
-import joblib
+"""LSTM next-sequence prediction for unsupervised sensor anomaly detection."""
+from collections import deque
 import os
-from utils.config import ANOMALY_CONFIG, SYSTEM_CONFIG
+from typing import Dict, Optional, Tuple
+
+import joblib
+import numpy as np
+import torch
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, precision_score, recall_score
+from sklearn.preprocessing import StandardScaler
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from utils.config import SEQUENCE_CONFIG, SYSTEM_CONFIG
 from utils.logger import logger
 
 
-class LSTMDetector:
-    """Simplified temporal anomaly detector using MLP (simulating LSTM behavior)."""
-    
+class SequencePredictorNetwork(nn.Module):
+    """Encoder/decoder LSTM that predicts a future sequence, not its input."""
+
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int,
+                 prediction_horizon: int, dropout: float):
+        super().__init__()
+        recurrent_dropout = dropout if num_layers > 1 else 0.0
+        self.prediction_horizon = prediction_horizon
+        self.encoder = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=recurrent_dropout)
+        self.decoder = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True, dropout=recurrent_dropout)
+        self.output = nn.Linear(hidden_dim, input_dim)
+
+    def forward(self, history: torch.Tensor) -> torch.Tensor:
+        _, state = self.encoder(history)
+        decoder_input = torch.zeros(history.shape[0], self.prediction_horizon, history.shape[2], device=history.device)
+        decoded, _ = self.decoder(decoder_input, state)
+        return self.output(decoded)
+
+
+class LSTMSequencePredictor:
+    """Train on normal history and classify future windows by prediction error."""
+
     def __init__(self):
-        self.config = ANOMALY_CONFIG["lstm"]
-        self.model = None
+        self.config = SEQUENCE_CONFIG
+        self.input_sequence_length = self.config["input_sequence_length"]
+        self.prediction_horizon = self.config["prediction_horizon"]
+        self.hidden_dim = self.config["hidden_dim"]
+        self.num_layers = self.config["num_layers"]
+        self.model: Optional[SequencePredictorNetwork] = None
         self.scaler = StandardScaler()
+        self.threshold: Optional[float] = None
+        self.feature_count: Optional[int] = None
         self.is_trained = False
-        self.threshold = None
-        self.sequence_length = self.config["sequence_length"]
-        self.model_path = os.path.join(SYSTEM_CONFIG["model_dir"], "lstm_detector.joblib")
-        
+        self.model_path = os.path.join(SYSTEM_CONFIG["model_dir"], "lstm_next_sequence.pt")
+        self.scaler_path = os.path.join(SYSTEM_CONFIG["model_dir"], "lstm_next_sequence_scaler.joblib")
+        self.history = deque(maxlen=self.input_sequence_length)
+        self.pending_prediction: Optional[np.ndarray] = None
+        self.pending_actual = []
         os.makedirs(SYSTEM_CONFIG["model_dir"], exist_ok=True)
-    
-    def _prepare_sequences(self, data: np.ndarray) -> tuple:
-        """Prepare sequences for training (input: sequence, output: next step)."""
-        X, y = [], []
-        
-        for i in range(len(data) - self.sequence_length):
-            sequence = data[i:i + self.sequence_length].flatten()
-            target = data[i + self.sequence_length]
-            X.append(sequence)
-            y.append(target)
-        
-        return np.array(X), np.array(y)
-    
-    def train(self, sequences: np.ndarray, feature_names=None):
-        """Train the temporal anomaly detector."""
-        logger.info("Training LSTM-style temporal detector...")
-        
-        self.feature_names = feature_names
-        if sequences.ndim == 2:
-            sequences = sequences.reshape(-1, self.sequence_length, sequences.shape[1] // self.sequence_length)
-        
-        flattened = sequences.reshape(len(sequences), -1)
-        
-        if feature_names is not None:
-            # Create multi-step feature names if provided
-            flat_feature_names = [f"{name}_t-{t}" for t in range(self.sequence_length) for name in feature_names]
-            flattened_df = pd.DataFrame(flattened, columns=flat_feature_names)
-            flattened_scaled = self.scaler.fit_transform(flattened_df)
-        else:
-            flattened_scaled = self.scaler.fit_transform(flattened)
-            
-        sequences_scaled = flattened_scaled.reshape(sequences.shape)
-        
-        X, y = [], []
-        for seq in sequences_scaled:
-            for i in range(len(seq) - 1):
-                input_window = seq[:i+1].flatten()
-                input_window = np.pad(input_window, (0, max(0, self.sequence_length * seq.shape[1] - len(input_window))), 
-                                     mode='constant')[:self.sequence_length * seq.shape[1]]
-                X.append(input_window)
-                y.append(seq[i+1])
-        
-        X = np.array(X)
-        y = np.array(y)
-        
-        hidden_units = self.config["hidden_units"]
-        self.model = MLPRegressor(
-            hidden_layer_sizes=(hidden_units * 2, hidden_units, hidden_units // 2),
-            activation='tanh',
-            solver='adam',
-            max_iter=self.config["epochs"],
-            random_state=42,
-            early_stopping=True
-        )
-        
-        self.model.fit(X, y)
-        
-        predictions = self.model.predict(X)
-        errors = np.mean((y - predictions) ** 2, axis=1)
-        self.threshold = np.percentile(errors, 95)
-        
+
+    def create_windows(self, stream: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Create [history -> future] windows while preserving stream order."""
+        stream = np.asarray(stream, dtype=np.float32)
+        window_count = len(stream) - self.input_sequence_length - self.prediction_horizon + 1
+        if window_count <= 0:
+            raise ValueError("The stream is shorter than one input plus prediction window.")
+        inputs = np.stack([stream[index:index + self.input_sequence_length] for index in range(window_count)])
+        targets = np.stack([stream[index + self.input_sequence_length:index + self.input_sequence_length + self.prediction_horizon] for index in range(window_count)])
+        return inputs, targets
+
+    def _build_model(self, feature_count: int) -> None:
+        self.model = SequencePredictorNetwork(feature_count, self.hidden_dim, self.num_layers, self.prediction_horizon, self.config["dropout"])
+
+    def _scaled_windows(self, stream: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        inputs, targets = self.create_windows(stream)
+        scaled_inputs = self.scaler.transform(inputs.reshape(-1, inputs.shape[-1])).reshape(inputs.shape)
+        scaled_targets = self.scaler.transform(targets.reshape(-1, targets.shape[-1])).reshape(targets.shape)
+        return scaled_inputs, scaled_targets
+
+    def _predict_scaled(self, inputs: np.ndarray) -> np.ndarray:
+        if self.model is None:
+            raise RuntimeError("The LSTM sequence predictor is not trained.")
+        self.model.eval()
+        with torch.no_grad():
+            return self.model(torch.from_numpy(np.asarray(inputs, dtype=np.float32))).cpu().numpy()
+
+    def _window_errors(self, stream: np.ndarray) -> np.ndarray:
+        inputs, targets = self._scaled_windows(stream)
+        predictions = self._predict_scaled(inputs)
+        return np.mean((targets - predictions) ** 2, axis=(1, 2))
+
+    def train(self, normal_train: np.ndarray, normal_validation: np.ndarray) -> Dict:
+        """Fit only on normal train windows and derive threshold from normal validation."""
+        torch.manual_seed(self.config["random_state"])
+        torch.set_num_threads(self.config["num_threads"])
+        np.random.seed(self.config["random_state"])
+        normal_train = np.asarray(normal_train, dtype=np.float32)
+        normal_validation = np.asarray(normal_validation, dtype=np.float32)
+        self.feature_count = normal_train.shape[1]
+        self.scaler.fit(normal_train)
+        inputs, targets = self._scaled_windows(normal_train)
+        self._build_model(self.feature_count)
+        dataset = TensorDataset(torch.from_numpy(inputs), torch.from_numpy(targets))
+        loader = DataLoader(dataset, batch_size=self.config["batch_size"], shuffle=True,
+                    num_workers=self.config["num_workers"])
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config["learning_rate"],
+                         weight_decay=self.config["weight_decay"])
+        loss_fn = nn.MSELoss()
+        for _ in range(self.config["epochs"]):
+            for batch_inputs, batch_targets in loader:
+                optimizer.zero_grad()
+                loss = loss_fn(self.model(batch_inputs), batch_targets)
+                loss.backward()
+                optimizer.step()
+        validation_errors = self._window_errors(normal_validation)
+        self.threshold = float(np.percentile(validation_errors, self.config["threshold_percentile"]))
         self.is_trained = True
-        
-        logger.success(f"Temporal detector trained. Threshold: {self.threshold:.4f}")
-        
-        return {
-            "n_sequences": len(sequences),
-            "threshold": float(self.threshold),
-            "mean_error": float(np.mean(errors)),
-            "max_error": float(np.max(errors))
-        }
-    
-    def predict_sequence(self, sequence: np.ndarray) -> tuple:
-        """Predict if a sequence contains temporal anomalies."""
-        if not self.is_trained:
-            return False, 0.5, []
-        
-        if sequence.ndim == 1:
-            n_features = len(sequence) // self.sequence_length
-            sequence = sequence.reshape(self.sequence_length, n_features)
-        
-        flattened = sequence.flatten().reshape(1, -1)
-        
-        if hasattr(self, 'feature_names') and self.feature_names is not None:
-            flat_feature_names = [f"{name}_t-{t}" for t in range(self.sequence_length) for name in self.feature_names]
-            flattened_df = pd.DataFrame(flattened, columns=flat_feature_names)
-            flattened_scaled = self.scaler.transform(flattened_df)
-        else:
-            flattened_scaled = self.scaler.transform(flattened)
-            
-        sequence_scaled = flattened_scaled.reshape(sequence.shape)
-        
-        errors = []
-        for i in range(len(sequence_scaled) - 1):
-            input_window = sequence_scaled[:i+1].flatten()
-            input_window = np.pad(input_window, (0, max(0, self.sequence_length * sequence.shape[1] - len(input_window))),
-                                 mode='constant')[:self.sequence_length * sequence.shape[1]]
-            input_window = input_window.reshape(1, -1)
-            
-            prediction = self.model.predict(input_window)
-            error = np.mean((sequence_scaled[i+1] - prediction) ** 2)
-            errors.append(error)
-        
-        if not errors:
-            return False, 0.5, []
-        
-        max_error = max(errors)
-        is_anomaly = max_error > self.threshold
-        anomaly_score = min(max_error / (self.threshold * 2), 1.0)
-        
-        return bool(is_anomaly), float(anomaly_score), errors
-    
-    def save(self):
-        """Save model to disk."""
-        if not self.is_trained:
-            return
-        
-        model_data = {
-            "model": self.model,
-            "scaler": self.scaler,
+        result = {
+            "input_sequence_length": self.input_sequence_length,
+            "prediction_horizon": self.prediction_horizon,
+            "n_training_windows": len(inputs),
+            "n_validation_windows": len(validation_errors),
             "threshold": self.threshold,
-            "sequence_length": self.sequence_length
+            "normal_validation_mean_error": float(validation_errors.mean())
         }
-        joblib.dump(model_data, self.model_path)
-        logger.info(f"Temporal detector saved to {self.model_path}")
-    
+        logger.success(f"LSTM next-sequence predictor trained. Threshold: {self.threshold:.6f}")
+        return result
+
+    def predict_next_sequence(self, history: np.ndarray) -> np.ndarray:
+        """Predict the future horizon after the supplied historical window."""
+        if not self.is_trained or self.feature_count is None:
+            raise RuntimeError("The LSTM sequence predictor is not trained.")
+        history = np.asarray(history, dtype=np.float32)
+        if history.shape != (self.input_sequence_length, self.feature_count):
+            raise ValueError(f"Expected history shape {(self.input_sequence_length, self.feature_count)}")
+        scaled = self.scaler.transform(history).reshape(1, self.input_sequence_length, self.feature_count)
+        prediction = self._predict_scaled(scaled)[0]
+        return self.scaler.inverse_transform(prediction)
+
+    def score_prediction(self, prediction: np.ndarray, actual: np.ndarray) -> Dict:
+        """Compare a completed future prediction with the actual future observations."""
+        prediction = np.asarray(prediction, dtype=np.float32)
+        actual = np.asarray(actual, dtype=np.float32)
+        if prediction.shape != actual.shape:
+            raise ValueError("Prediction and actual future sequences must have the same shape.")
+        scaled_prediction = self.scaler.transform(prediction)
+        scaled_actual = self.scaler.transform(actual)
+        error = float(np.mean((scaled_actual - scaled_prediction) ** 2))
+        return {"ready": True, "prediction_error": error, "anomaly_threshold": float(self.threshold),
+                "is_anomaly": bool(error > self.threshold), "predicted_sequence": prediction, "actual_sequence": actual}
+
+    def observe(self, reading: np.ndarray) -> Dict:
+        """Consume one reading and score only when a pending future is complete."""
+        reading = np.asarray(reading, dtype=np.float32)
+        self.history.append(reading)
+        result = {"ready": False, "is_anomaly": False, "prediction_error": None,
+                  "anomaly_threshold": self.threshold, "predicted_sequence": None, "actual_sequence": None}
+        if self.pending_prediction is not None:
+            self.pending_actual.append(reading.copy())
+            if len(self.pending_actual) == self.prediction_horizon:
+                result = self.score_prediction(self.pending_prediction, np.asarray(self.pending_actual))
+                self.pending_prediction = None
+                self.pending_actual = []
+        if len(self.history) == self.input_sequence_length and self.pending_prediction is None:
+            self.pending_prediction = self.predict_next_sequence(np.asarray(self.history))
+        return result
+
+    def reset_stream(self) -> None:
+        """Clear rolling inference state before starting a new simulated stream."""
+        self.history.clear()
+        self.pending_prediction = None
+        self.pending_actual = []
+
+    def evaluate(self, test_stream: np.ndarray, point_labels: np.ndarray) -> Dict:
+        """Evaluate future-window errors using labels only after training is complete."""
+        inputs, _ = self.create_windows(test_stream)
+        errors = self._window_errors(test_stream)
+        labels = np.asarray([int(np.any(point_labels[index + self.input_sequence_length:index + self.input_sequence_length + self.prediction_horizon] != 0)) for index in range(len(inputs))])
+        predictions = (errors > self.threshold).astype(int)
+        tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
+        return {"threshold": float(self.threshold),
+            "normal_windows": int(np.sum(labels == 0)),
+            "anomaly_windows": int(np.sum(labels == 1)),
+                "normal_mean_error": float(errors[labels == 0].mean()) if np.any(labels == 0) else 0.0,
+                "anomaly_mean_error": float(errors[labels == 1].mean()) if np.any(labels == 1) else 0.0,
+                "accuracy": float(accuracy_score(labels, predictions)),
+                "precision": float(precision_score(labels, predictions, zero_division=0)),
+                "recall": float(recall_score(labels, predictions, zero_division=0)),
+                "f1": float(f1_score(labels, predictions, zero_division=0)),
+                "confusion_matrix": [[int(tn), int(fp)], [int(fn), int(tp)]]}
+
+    def save(self) -> None:
+        if not self.is_trained or self.model is None:
+            raise RuntimeError("Cannot save an untrained predictor.")
+        torch.save({"state_dict": self.model.state_dict(), "feature_count": self.feature_count,
+                    "config": self.config, "threshold": self.threshold}, self.model_path)
+        joblib.dump(self.scaler, self.scaler_path)
+
     def load(self) -> bool:
-        """Load model from disk."""
-        if os.path.exists(self.model_path):
-            model_data = joblib.load(self.model_path)
-            self.model = model_data["model"]
-            self.scaler = model_data["scaler"]
-            self.threshold = model_data["threshold"]
-            self.sequence_length = model_data["sequence_length"]
-            self.is_trained = True
-            logger.info("Temporal detector loaded successfully.")
-            return True
-        return False
-
-
-if __name__ == "__main__":
-    from iot.simulator import IoTSimulator
-    
-    simulator = IoTSimulator()
-    sequences, labels = simulator.generate_sequence_data(n_sequences=200, sequence_length=10)
-    
-    normal_sequences = sequences[labels == 0]
-    
-    detector = LSTMDetector()
-    results = detector.train(normal_sequences)
-    
-    print("\nTraining Results:")
-    print(f"  Sequences: {results['n_sequences']}")
-    print(f"  Threshold: {results['threshold']:.4f}")
-    print(f"  Mean Error: {results['mean_error']:.4f}")
-    
-    test_sequences, test_labels = simulator.generate_sequence_data(n_sequences=5, sequence_length=10)
-    
-    print("\nTest predictions:")
-    for i, (seq, label) in enumerate(zip(test_sequences, test_labels)):
-        is_anomaly, score, _ = detector.predict_sequence(seq)
-        print(f"  Seq {i}: Actual={label}, Predicted Anomaly={is_anomaly}, Score={score:.3f}")
-    
-    detector.save()
+        if not os.path.exists(self.model_path) or not os.path.exists(self.scaler_path):
+            return False
+        checkpoint = torch.load(self.model_path, map_location="cpu", weights_only=True)
+        self.feature_count = int(checkpoint["feature_count"])
+        self.threshold = float(checkpoint["threshold"])
+        self._build_model(self.feature_count)
+        self.model.load_state_dict(checkpoint["state_dict"])
+        self.scaler = joblib.load(self.scaler_path)
+        self.is_trained = True
+        return True

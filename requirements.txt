@@ -1,0 +1,13 @@
+streamlit
+pandas
+numpy
+opencv-python-headless
+pillow
+colorama
+ultralytics
+deep-sort-realtime
+scikit-learn
+joblib
+torch
+torchvision
+setuptools<81

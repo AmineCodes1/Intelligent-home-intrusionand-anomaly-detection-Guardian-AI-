@@ -1,6 +1,5 @@
 """Simulated IoT sensor data generator."""
 import numpy as np
-import pandas as pd
 import time
 from typing import Generator, Dict, Tuple
 from utils.config import IOT_CONFIG
@@ -33,32 +32,6 @@ class IoTSimulator:
             noise = self.rng.uniform(-0.5, 0.5)
             return float(np.clip(value + noise, cfg["min"], cfg["max"]))
     
-    def _generate_intrusion_reading(self, sensor: str) -> float:
-        """Generate an intrusion-indicating reading with high variability."""
-        cfg = self.config[sensor]
-        normal_min, normal_max = cfg["normal_range"]
-        
-        # Increase variability by using different distributions and ranges
-        if sensor == "vibration":
-            # Dynamic vibration: sometimes subtle, sometimes violent
-            return float(self.rng.uniform(35, 110))
-        elif sensor == "audio":
-            # Burst of sound
-            return float(self.rng.uniform(65, 130))
-        elif sensor == "temperature":
-            # Sudden heat or cold (fire or window open)
-            return float(self.rng.choice([
-                self.rng.uniform(cfg["min"], normal_min - 1),
-                self.rng.uniform(normal_max + 2, cfg["max"])
-            ]))
-        elif sensor == "co2":
-            # Gradual or sudden CO2 spike
-            return float(self.rng.uniform(1100, 4000))
-        elif sensor == "pir_motion":
-            # Intrusion usually means motion, but maybe not 100% of the time (stealth)
-            return float(self.rng.choice([1.0, 0.0], p=[0.9, 0.1]))
-        return self._generate_normal_reading(sensor)
-    
     def _generate_anomaly_reading(self, sensor: str) -> float:
         """Generate an anomalous reading (random spikes/drops)."""
         cfg = self.config[sensor]
@@ -80,16 +53,10 @@ class IoTSimulator:
                 # Heavy noise
                 return float(self.rng.uniform(cfg["min"], cfg["max"]))
     
-    def generate_single_reading(self, include_intrusion=False) -> Tuple[Dict[str, float], str]:
-        """Generate a single reading from all sensors."""
-        if include_intrusion:
-            roll = self.rng.random()
-            if roll < 0.4: # Reduced normal chance
-                self.current_state = "normal"
-            elif roll < 0.7:
-                self.current_state = "anomaly"
-            else:
-                self.current_state = "intrusion"
+    def generate_single_reading(self, include_anomaly=False) -> Tuple[Dict[str, float], str]:
+        """Generate a sensor reading with optional non-human sensor faults."""
+        if include_anomaly and self.rng.random() < 0.5:
+            self.current_state = "anomaly"
         else:
             self.current_state = "normal"
         
@@ -98,54 +65,58 @@ class IoTSimulator:
         for sensor in self.config.keys():
             if self.current_state == "normal":
                 reading[sensor] = self._generate_normal_reading(sensor)
-            elif self.current_state == "intrusion":
-                reading[sensor] = self._generate_intrusion_reading(sensor)
             else:
                 reading[sensor] = self._generate_anomaly_reading(sensor)
         
         return reading, self.current_state
     
-    def generate_stream(self, n_samples=100, include_intrusion=True) -> Generator:
-        """Generate a stream of sensor readings."""
+    def generate_stream(self, n_samples=100, include_anomalies=False) -> Generator:
+        """Generate a stream of sensor readings and optional sensor anomalies."""
         for _ in range(n_samples):
-            reading, state = self.generate_single_reading(include_intrusion)
+            reading, state = self.generate_single_reading(include_anomaly=include_anomalies)
             yield reading, state
             time.sleep(0.01)
-    
-    def generate_dataset(self, n_samples=1000, include_intrusion=True) -> pd.DataFrame:
-        """Generate a labeled dataset for training with high entropy."""
-        data = []
-        labels = []
-        
+
+    def generate_normal_sensor_stream(self, n_samples=1000) -> np.ndarray:
+        """Generate only ordered normal sensor values for self-supervised training."""
+        readings = []
         for _ in range(n_samples):
-            reading, state = self.generate_single_reading(include_intrusion)
-            reading_values = {k: v for k, v in reading.items() if k != "timestamp"}
-            data.append(reading_values)
-            labels.append(0 if state == "normal" else (1 if state == "intrusion" else 2))
-        
-        df = pd.DataFrame(data)
-        df["label"] = labels
-        # Shuffle to avoid sequence bias
-        df = df.sample(frac=1).reset_index(drop=True)
-        return df
-    
-    def generate_sequence_data(self, n_sequences=100, sequence_length=10, include_anomalies=True) -> Tuple[np.ndarray, np.ndarray]:
-        """Generate sequence data for LSTM/autoencoder training."""
-        all_sequences = []
-        all_labels = []
-        
-        for _ in range(n_sequences):
-            is_anomaly = include_anomalies and self.rng.random() < 0.2
-            sequence = []
-            
-            for _ in range(sequence_length):
+            reading, _ = self.generate_single_reading(include_anomaly=False)
+            readings.append([reading[sensor] for sensor in self.config.keys()])
+        return np.asarray(readings, dtype=np.float32)
+
+    def generate_evaluation_stream(self, block_length=30, n_blocks=20) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate alternating normal and anomalous blocks for balanced temporal evaluation."""
+        readings = []
+        labels = []
+        for block_index in range(n_blocks):
+            is_anomaly = block_index % 2 == 1
+            for _ in range(block_length):
                 if is_anomaly:
-                    reading, _ = self.generate_single_reading(include_intrusion=True)
+                    reading, _ = self.generate_single_reading(include_anomaly=False)
+                    if block_index % 4 == 1:
+                        subtle_sensor = list(self.config.keys())[block_index % len(self.config)]
+                        offsets = {
+                            "vibration": 8.0,
+                            "audio": 12.0,
+                            "temperature": 4.0,
+                            "co2": 250.0,
+                            "pir_motion": 1.0
+                        }
+                        cfg = self.config[subtle_sensor]
+                        reading[subtle_sensor] = float(np.clip(
+                            reading[subtle_sensor] + offsets[subtle_sensor],
+                            cfg["min"], cfg["max"]
+                        ))
+                    else:
+                        reading = {
+                            sensor: self._generate_anomaly_reading(sensor)
+                            for sensor in self.config.keys()
+                        }
+                    label = 1
                 else:
-                    reading, _ = self.generate_single_reading(include_intrusion=False)
-                sequence.append([reading[s] for s in self.config.keys()])
-            
-            all_sequences.append(sequence)
-            all_labels.append(1 if is_anomaly else 0)
-        
-        return np.array(all_sequences), np.array(all_labels)
+                    reading, _ = self.generate_single_reading(include_anomaly=False)
+                    label = 0
+                readings.append([reading[sensor] for sensor in self.config.keys()])
+                labels.append(label)
+        return np.asarray(readings, dtype=np.float32), np.asarray(labels, dtype=np.int64)

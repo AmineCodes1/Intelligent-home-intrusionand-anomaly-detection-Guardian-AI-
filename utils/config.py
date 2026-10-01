@@ -9,7 +9,6 @@ IOT_CONFIG = {
         "pir_motion": {"min": 0, "max": 1, "normal_range": (0, 0), "unit": "binary"}
     },
     "sampling_rate": 1.0,
-    "anomaly_threshold": 0.7
 }
 
 CAMERA_CONFIG = {
@@ -20,46 +19,20 @@ CAMERA_CONFIG = {
     "tracking_enabled": True
 }
 
-ML_CONFIG = {
-    "models": {
-        "random_forest": {
-            "n_estimators": 100,
-            "max_depth": 10,
-            "random_state": 42
-        },
-        "svm": {
-            "kernel": "rbf",
-            "C": 0.5,
-            "gamma": 0.1
-        },
-        "xgboost": {
-            "n_estimators": 100,
-            "max_depth": 6,
-            "learning_rate": 0.1,
-            "random_state": 42
-        }
-    },
-    "test_size": 0.2,
+SEQUENCE_CONFIG = {
+    "input_sequence_length": 10,
+    "prediction_horizon": 5,
+    "hidden_dim": 32,
+    "num_layers": 1,
+    "dropout": 0.0,
+    "learning_rate": 0.001,
+    "batch_size": 64,
+    "num_workers": 0,
+    "weight_decay": 0.0,
+    "epochs": 10,
+    "num_threads": 1,
+    "threshold_percentile": 95.0,
     "random_state": 42
-}
-
-ANOMALY_CONFIG = {
-    "isolation_forest": {
-        "n_estimators": 100,
-        "contamination": 0.1,
-        "random_state": 42
-    },
-    "autoencoder": {
-        "encoding_dim": 8,
-        "epochs": 50,
-        "batch_size": 32
-    },
-    "lstm": {
-        "sequence_length": 10,
-        "hidden_units": 32,
-        "epochs": 50,
-        "batch_size": 32
-    }
 }
 
 SYSTEM_CONFIG = {
